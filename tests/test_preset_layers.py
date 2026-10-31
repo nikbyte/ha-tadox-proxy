@@ -1580,3 +1580,64 @@ class TestStateRoundTrip:
 
         assert room.active_preset == COMFORT
         assert effects.timers == {WINDOW_OPEN: 30}
+
+
+class TestTimedManualRestore:
+    def test_keep_cancels_a_running_timer_and_does_not_restore_it(self):
+        room = _room(manual_mode_action="timer", manual_mode_duration_min=1)
+        room.pick_preset(ECO, T0)
+        room.set_temperature(21.5, T0 + 1)
+        before = room.attributes()
+
+        room.options_changed(_config(manual_mode_action="keep"), T0 + 2)
+        assert "manual_return_at_ts" not in room.attributes()
+        room.timer_elapsed(_layers.TIMER_MANUAL_RETURN, T0 + 62)
+        assert room.active_preset == MANUAL
+
+        restarted = _room(manual_mode_action="keep")
+        snapshot = StartSnapshot.from_state(
+            "heat", before, window_state=OFF, presence_state=ON
+        )
+        effects = restarted.start(snapshot, T0 + 2)
+        assert restarted.active_preset == MANUAL
+        assert _layers.TIMER_MANUAL_RETURN not in effects.timers
+
+    def test_expired_deadline_restores_the_previous_preset_after_restart(self):
+        room = _room(manual_mode_action="timer", manual_mode_duration_min=1)
+        room.pick_preset(ECO, T0)
+        room.set_temperature(21.5, T0 + 1)
+        snapshot = StartSnapshot.from_state(
+            "heat", room.attributes(), window_state=OFF, presence_state=ON
+        )
+
+        restarted = _room(manual_mode_action="timer")
+        restarted.start(snapshot, T0 + 62)
+        assert restarted.active_preset == ECO
+        assert "manual_return_at_ts" not in restarted.attributes()
+
+    def test_legacy_manual_hidden_by_away_keeps_its_target_and_deadline(self):
+        snapshot = StartSnapshot.from_state(
+            "heat",
+            {
+                "preset_mode": AWAY_PRESET,
+                "temperature": 16.0,
+                "presence_away_active": True,
+                "manual_return_preset": ECO,
+                "manual_return_target_c": 21.5,
+                "manual_return_at_ts": T0 + 120,
+            },
+            window_state=OFF,
+            presence_state=OFF,
+        )
+        room = _room(manual_mode_action="timer")
+        room.start(snapshot, T0)
+        assert room.active_preset == AWAY_PRESET
+
+        room.presence_reported(ON, T0 + 1)
+        room.timer_elapsed(HOME, T0 + 31)
+        assert room.active_preset == MANUAL
+        assert room.room_target_c == 21.5
+        assert room.attributes()["manual_return_at_ts"] == T0 + 120
+
+        room.timer_elapsed(_layers.TIMER_MANUAL_RETURN, T0 + 120)
+        assert room.active_preset == ECO

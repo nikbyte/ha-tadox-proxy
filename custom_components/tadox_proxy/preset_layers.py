@@ -41,10 +41,13 @@ TIMER_WINDOW_CLOSE = "window_close"
 TIMER_AWAY = "away"
 TIMER_HOME = "home"
 TIMER_BOOST = "boost"
+TIMER_MANUAL_RETURN = "manual_return"
 
 # State attributes of the climate entity, read back after a restart.
 ATTR_USER_PRESET = "user_preset"
 ATTR_MANUAL_TARGET = "manual_target_c"
+ATTR_MANUAL_RETURN_PRESET = "manual_return_preset"
+ATTR_MANUAL_RETURN_AT_TS = "manual_return_at_ts"
 ATTR_WINDOW_OPEN_ACTIVE = "window_open_active"
 ATTR_WINDOW_CLOSE_DELAY_ACTIVE = "window_close_delay_active"
 ATTR_PRESENCE_AWAY_ACTIVE = "presence_away_active"
@@ -85,6 +88,8 @@ class LayersConfig:
     # Whether a window / presence sensor is configured at all.
     has_window_sensor: bool
     has_presence_sensor: bool
+    manual_mode_action: str = "keep"
+    manual_mode_duration_min: int = 15
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,8 @@ class StartSnapshot:
     # The user choice; None for a state written by v1.4.x (or no state).
     user_preset: str | None = None
     manual_c: float | None = None
+    manual_return_preset: str | None = None
+    manual_return_at_ts: float | None = None
     window_held: bool = False
     nobody_home_held: bool = False
     valve_off_by_window: bool = False
@@ -141,7 +148,11 @@ class StartSnapshot:
             heating_on=state != _HVAC_OFF,
             preset_mode=attributes.get(_HA_ATTR_PRESET_MODE),
             user_preset=attributes.get(ATTR_USER_PRESET),
-            manual_c=safe_float(attributes.get(ATTR_MANUAL_TARGET)),
+            manual_c=safe_float(
+                attributes.get(ATTR_MANUAL_TARGET, attributes.get("manual_return_target_c"))
+            ),
+            manual_return_preset=attributes.get(ATTR_MANUAL_RETURN_PRESET),
+            manual_return_at_ts=safe_float(attributes.get(ATTR_MANUAL_RETURN_AT_TS)),
             window_held=attributes.get(ATTR_WINDOW_OPEN_ACTIVE) is True,
             nobody_home_held=attributes.get(ATTR_PRESENCE_AWAY_ACTIVE) is True,
             valve_off_by_window=attributes.get(ATTR_WINDOW_TRV_OFF) is True,
@@ -188,6 +199,8 @@ class PresetLayers:
         # paused).
         self._boost_left_s: float | None = None
         self._boost_since: float | None = None
+        self._manual_return_preset: str | None = None
+        self._manual_return_at_ts: float | None = None
         # Timers the caller runs for this module, and what to tell the
         # caller about them after the current event.
         self._armed: set[str] = set()
@@ -214,9 +227,11 @@ class PresetLayers:
             return self._effects("preset_change")
         self._change_by_person()
         if preset == PRESET_BOOST:
+            self._cancel_manual_return()
             self._start_boost()
             return self._effects("preset_change")
         self._end_boost()
+        self._cancel_manual_return()
         if not self._layer_forces(preset):
             self._user = UserChoice(preset)
         return self._effects("preset_change")
@@ -293,6 +308,8 @@ class PresetLayers:
         """
         self._begin(now)
         self._config = config
+        if config.manual_mode_action == "keep":
+            self._cancel_manual_return()
         return self._effects("options_changed")
 
     def heating_off(self, now: float) -> Effects:
@@ -358,6 +375,14 @@ class PresetLayers:
         self._valve_off_by_window = snapshot.valve_off_by_window
         if snapshot.user_preset is None:
             self._user, window_held, nobody_home_held = self._upgrade_from_v14(snapshot)
+            # The earlier timer patch kept Manual's target separately while
+            # window/presence protection was shown. Preserve that user choice.
+            if (
+                snapshot.manual_return_preset in _CHOOSABLE
+                and snapshot.manual_return_at_ts is not None
+                and snapshot.manual_c is not None
+            ):
+                self._user = UserChoice(PRESET_NONE, snapshot.manual_c)
         else:
             self._user = _user_choice(snapshot.user_preset, snapshot.manual_c)
             window_held = snapshot.window_held
@@ -375,6 +400,19 @@ class PresetLayers:
                 self._nobody_home_holds = True
             elif snapshot.presence_state == _OFF:
                 self._start_away_delay()
+        if (
+            self._config.manual_mode_action == "timer"
+            and self._user.preset == PRESET_NONE
+            and snapshot.manual_return_preset in _CHOOSABLE
+            and snapshot.manual_return_at_ts is not None
+        ):
+            self._manual_return_preset = snapshot.manual_return_preset
+            self._manual_return_at_ts = snapshot.manual_return_at_ts
+            if self._manual_return_at_ts <= now:
+                self._user = UserChoice(self._manual_return_preset)
+                self._cancel_manual_return()
+            else:
+                self._arm(TIMER_MANUAL_RETURN, self._manual_return_at_ts - now)
         return self._effects(None)
 
     def timer_elapsed(self, timer_id: str, now: float) -> Effects:
@@ -399,6 +437,8 @@ class PresetLayers:
             return PRESET_AWAY
         if self._boost_left_s is not None:
             return PRESET_BOOST
+        if self._user.preset == PRESET_NONE:
+            return PRESET_NONE
         return self._user.preset
 
     @property
@@ -437,6 +477,9 @@ class PresetLayers:
         }
         if self._user.preset == PRESET_NONE:
             attrs[ATTR_MANUAL_TARGET] = self._user.manual_c
+        if self._manual_return_preset is not None and self._manual_return_at_ts is not None:
+            attrs[ATTR_MANUAL_RETURN_PRESET] = self._manual_return_preset
+            attrs[ATTR_MANUAL_RETURN_AT_TS] = self._manual_return_at_ts
         if self._valve_off_by_window:
             attrs[ATTR_WINDOW_TRV_OFF] = True
         return attrs
@@ -500,6 +543,20 @@ class PresetLayers:
         self._begin(now)
         self._change_by_person()
         self._end_boost()
+        if self._config.manual_mode_action == "timer":
+            previous = self._manual_return_preset or self._user.preset
+            if previous in _CHOOSABLE:
+                delay_s = self._config.manual_mode_duration_min * 60
+                if delay_s > 0:
+                    self._manual_return_preset = previous
+                    self._manual_return_at_ts = now + delay_s
+                    self._arm(TIMER_MANUAL_RETURN, delay_s)
+                else:
+                    self._cancel_manual_return()
+            else:
+                self._cancel_manual_return()
+        else:
+            self._cancel_manual_return()
         limited = max(self._config.min_target_c, min(self._config.max_target_c, temp_c))
         self._user = UserChoice(PRESET_NONE, limited)
         return self._effects(trigger)
@@ -592,8 +649,19 @@ class PresetLayers:
             if self._presence_state == _ON:
                 self._nobody_home_holds = False
             return "presence_home"
+        if timer_id == TIMER_MANUAL_RETURN:
+            previous = self._manual_return_preset
+            self._cancel_manual_return()
+            if previous in _CHOOSABLE:
+                self._user = UserChoice(previous)
+            return "manual_return"
         self._end_boost()
         return "boost_expired"
+
+    def _cancel_manual_return(self) -> None:
+        self._disarm(TIMER_MANUAL_RETURN)
+        self._manual_return_preset = None
+        self._manual_return_at_ts = None
 
     def _start_boost(self) -> None:
         """Start the boost with its full time (also when one is running)."""
