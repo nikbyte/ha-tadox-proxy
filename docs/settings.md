@@ -44,11 +44,31 @@ or an away phase.
 Moving the temperature slider without picking a preset switches to **Manual**. Your
 stored Comfort temperature is left alone, so you can always get back to it.
 
+### Manual duration
+
 In the **Manual mode** options, you can keep Manual until you pick another preset
 (the default), or return to the preset selected before Manual after a timer. The timer
 defaults to 15 minutes, restarts whenever you change the manual temperature, and
 survives a Home Assistant restart. Window and presence protection keep their priority
 while the timer continues to run.
+
+### Weekly schedule
+
+The **Weekly schedule** options let you add start times and choose Comfort, Eco,
+Frost Protection or Off for each day. A block continues until the next block,
+including across midnight and the end of the week. The schedule is stored in the
+integration options and survives restarts; no Schedule helper is needed.
+
+With a schedule, Manual can also last **until the next schedule block**. A timed
+Manual change lasts its full duration even if blocks change meanwhile, then resumes
+the block active at expiry. Picking a named preset cancels Manual and holds that
+choice until the next block. A manual Off also lasts until the next block, which
+can turn heating back on. Restarting or receiving a sensor report does not end
+either override; a block missed while HA was stopped is applied on startup.
+
+Window protection, Presence Away and Boost take priority over scheduled blocks,
+including Off. Once they end, the current block resumes. A manual Off keeps the
+heating off until the next block.
 
 ### Your choice, and what can take over
 

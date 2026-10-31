@@ -52,9 +52,22 @@
               "manual_mode_duration_min": "Dauer des manuellen Modus"
             },
             "data_description": {
-              "manual_mode_action": "Manuell beibehalten, bis ein anderes Profil gewählt wird, oder nach einem Timer zum vorherigen Profil zurückkehren. Jede neue manuelle Änderung startet den Timer neu.",
+              "manual_mode_action": "Manuell beibehalten, bis zum nächsten Wochenblock oder nach einem Timer zurückkehren. Ein Timer kehrt zum aktiven Zeitplanprofil zurück, wenn ein Zeitplan eingerichtet ist.",
               "manual_mode_duration_min": "Dauer des manuellen Modus bei zeitgesteuerter Rückkehr. Standard: 15 Minuten."
             }
+          },
+          "weekly_schedule": {
+            "name": "Wochenzeitplan",
+            "data": {
+              "monday": "Montag",
+              "tuesday": "Dienstag",
+              "wednesday": "Mittwoch",
+              "thursday": "Donnerstag",
+              "friday": "Freitag",
+              "saturday": "Samstag",
+              "sunday": "Sonntag"
+            },
+            "description": "Füge Startzeiten und Profile für jeden Tag hinzu. Ein Profil bleibt bis zum nächsten Block aktiv, auch über Mitternacht hinweg. Abwesenheit und Fensterschutz haben Vorrang."
           },
           "window_sensor": {
             "name": "Fenstersensor",
@@ -153,14 +166,17 @@
       "backup_sensor_required": "Für diese Aktion einen Ersatz-Raumsensor auswählen.",
       "backup_sensor_same": "Der Ersatz-Raumsensor muss sich vom externen Temperatursensor unterscheiden.",
       "temp_entity_not_found": "Externer Temperatursensor nicht gefunden.",
-      "temp_not_temperature": "Bitte einen Temperatursensor (device_class: temperature) auswählen."
+      "temp_not_temperature": "Bitte einen Temperatursensor (device_class: temperature) auswählen.",
+      "schedule_required": "Füge einen Wochenblock hinzu, um 'bis zum nächsten Zeitplanblock' zu verwenden.",
+      "invalid_weekly_schedule": "Prüfe die Wochenblöcke: jede Uhrzeit darf pro Tag nur einmal vorkommen und jeder Block benötigt ein gültiges Profil."
     }
   },
   "selector": {
     "manual_mode_action": {
       "options": {
         "keep": "Im manuellen Modus bleiben",
-        "timer": "Nach einem Timer zum vorherigen Profil zurückkehren"
+        "schedule": "Bis zum nächsten Zeitplanblock",
+        "timer": "Nach einem Timer zurückkehren"
       }
     },
     "sensor_loss_action": {
@@ -168,6 +184,20 @@
         "hold": "Letzten TRV-Befehl halten",
         "backup_sensor": "Mit Ersatz-Raumsensor regeln",
         "trv": "TRV selbst regeln lassen"
+      }
+    },
+    "weekly_schedule_block": {
+      "fields": {
+        "start": {"name": "Startzeit"},
+        "preset": {"name": "Profil"}
+      }
+    },
+    "schedule_preset": {
+      "options": {
+        "comfort": "Komfort",
+        "eco": "Eco",
+        "frost_protection": "Frostschutz",
+        "off": "Aus"
       }
     },
     "window_action": {

@@ -13,6 +13,7 @@ import time
 from homeassistant.components.climate import HVACMode
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
+from homeassistant.util import dt as dt_util
 
 from .climate_controllers import DEFAULT_WINDOW_ACTION, safe_float
 from .const import (
@@ -22,6 +23,7 @@ from .const import (
     CONF_PRESENCE_AWAY_DELAY_S,
     CONF_PRESENCE_HOME_DELAY_S,
     CONF_PRESENCE_SENSOR_ID,
+    CONF_WEEKLY_PRESET_SCHEDULE,
     CONF_WINDOW_ACTION,
     CONF_WINDOW_CLOSE_DELAY_S,
     CONF_WINDOW_DELAY_S,
@@ -36,7 +38,8 @@ from .parameters import (
     DEFAULT_WINDOW_DELAY_S,
     FROST_PROTECT_C,
 )
-from .preset_layers import Effects, LayersConfig
+from .preset_layers import TIMER_MANUAL_RETURN, Effects, LayersConfig
+from .schedule import next_weekly_event_ts
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +68,11 @@ class PresetMixin:
     async def _async_handle_layer_effects(self, effects: Effects) -> None:
         """Apply *effects* and run the regulation cycle they ask for."""
         trigger = self._apply_layer_effects(effects)
+        await self._async_run_layer_cycle(trigger)
+
+    async def _async_run_layer_cycle(self, trigger: str | None) -> None:
+        if self._schedule() and await self._async_sync_schedule_hvac():
+            return
         if trigger is not None:
             await self._async_regulation_cycle(trigger=trigger)
 
@@ -72,8 +80,8 @@ class PresetMixin:
     def _handle_layer_effects(self, effects: Effects) -> None:
         """Apply *effects* from a callback; the regulation cycle runs as a task."""
         trigger = self._apply_layer_effects(effects)
-        if trigger is not None:
-            self.hass.async_create_task(self._async_regulation_cycle(trigger=trigger))
+        if trigger is not None or self._schedule():
+            self.hass.async_create_task(self._async_run_layer_cycle(trigger))
 
     def _start_layer_timer(self, timer_id: str, delay_s: float) -> None:
         """Report *timer_id* to PresetLayers as elapsed after *delay_s*."""
@@ -82,6 +90,12 @@ class PresetMixin:
             # Cancelled or started anew meanwhile: no news.
             if self._layer_timers.get(timer_id) is not cancel:
                 return
+            if timer_id == TIMER_MANUAL_RETURN and self._schedule():
+                # At an exact block boundary, use the new block before
+                # Manual ends, regardless of callback ordering.
+                await self._async_apply_schedule_state()
+                if self._layer_timers.get(timer_id) is not cancel:
+                    return
             del self._layer_timers[timer_id]
             await self._async_handle_layer_effects(
                 self._layers.timer_elapsed(timer_id, time.time())
@@ -102,6 +116,7 @@ class PresetMixin:
     def _layers_config(self) -> LayersConfig:
         """PresetLayers' view of the options."""
         opts = self._config_entry.options
+        schedule = opts.get(CONF_WEEKLY_PRESET_SCHEDULE, {})
         return LayersConfig(
             presets=self._config.presets,
             comfort_c=self._comfort_target(),
@@ -119,6 +134,9 @@ class PresetMixin:
             manual_mode_action=opts.get(CONF_MANUAL_MODE_ACTION, DEFAULT_MANUAL_MODE_ACTION),
             manual_mode_duration_min=opts.get(
                 CONF_MANUAL_MODE_DURATION_MIN, DEFAULT_MANUAL_MODE_DURATION_MIN
+            ),
+            next_schedule_at_ts=(
+                next_weekly_event_ts(schedule, dt_util.now()) if schedule else None
             ),
         )
 
@@ -171,9 +189,12 @@ class PresetMixin:
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Pick a preset (Home Assistant has checked it against the list)."""
         _LOGGER.debug("Preset picked: %s", preset_mode)
+        self._schedule_manual_off = False
         await self._async_handle_layer_effects(
             self._layers.pick_preset(preset_mode, time.time())
         )
+        if self._schedule() and self._hvac_mode == HVACMode.OFF:
+            await self.async_set_hvac_mode(HVACMode.HEAT, _from_schedule=True)
 
     def _comfort_target(self) -> float:
         """Return the configured comfort target, falling back to the default.

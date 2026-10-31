@@ -230,6 +230,7 @@ async def _async_submit_sensor_loss_options(hass, entry, **top_level: Any):
         "window_sensor": {"window_sensor_id": WINDOW_SENSOR},
         "presence_sensor": {"presence_sensor_id": PRESENCE_SENSOR},
         "manual_mode": {},
+        "weekly_schedule": {},
         "pi_controller": {},
         "gain_scheduling": {},
         "trv_communication": {},

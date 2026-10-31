@@ -1641,3 +1641,45 @@ class TestTimedManualRestore:
 
         room.timer_elapsed(_layers.TIMER_MANUAL_RETURN, T0 + 120)
         assert room.active_preset == ECO
+
+
+class TestWeeklyPresetLayer:
+    def test_named_choice_survives_reports_and_restart_until_a_new_block(self):
+        room = _room(next_schedule_at_ts=T0 + 60)
+        room.schedule_changed(COMFORT, T0 + 60, T0, boundary=False)
+        room.pick_preset(ECO, T0 + 1)
+        room.schedule_changed(COMFORT, T0 + 60, T0 + 2, boundary=False)
+        assert room.active_preset == ECO
+
+        snapshot = StartSnapshot.from_state(
+            "heat", room.attributes(), window_state=OFF, presence_state=ON
+        )
+        restarted = _room(next_schedule_at_ts=T0 + 60)
+        restarted.start(snapshot, T0 + 3)
+        restarted.schedule_changed(COMFORT, T0 + 60, T0 + 3, boundary=False)
+        assert restarted.active_preset == ECO
+
+        restarted.schedule_changed(COMFORT, T0 + 120, T0 + 60, boundary=True)
+        assert restarted.active_preset == COMFORT
+
+    def test_until_next_block_uses_only_the_schedule_clock(self):
+        room = _room(manual_mode_action="schedule", next_schedule_at_ts=T0 + 60)
+        room.schedule_changed(ECO, T0 + 60, T0, boundary=False)
+        effects = room.set_temperature(21.5, T0 + 1)
+        assert _layers.TIMER_MANUAL_RETURN not in effects.timers
+        assert room.active_preset == MANUAL
+        room.schedule_changed(COMFORT, T0 + 120, T0 + 60, boundary=True)
+        assert room.active_preset == COMFORT
+        assert "manual_return_at_ts" not in room.attributes()
+
+    def test_timed_manual_ignores_blocks_then_returns_to_the_current_one(self):
+        room = _room(
+            manual_mode_action="timer", manual_mode_duration_min=2,
+            next_schedule_at_ts=T0 + 60,
+        )
+        room.schedule_changed(COMFORT, T0 + 60, T0, boundary=False)
+        room.set_temperature(21.5, T0 + 1)
+        room.schedule_changed(ECO, T0 + 180, T0 + 60, boundary=True)
+        assert room.active_preset == MANUAL
+        room.timer_elapsed(_layers.TIMER_MANUAL_RETURN, T0 + 121)
+        assert room.active_preset == ECO

@@ -47,6 +47,7 @@ from .climate_controllers import (
 )
 from .climate_presets import PresetMixin
 from .climate_regulation import RegulationMixin
+from .climate_schedule import ScheduleMixin
 from .const import (
     CONF_AWAY_TARGET,
     CONF_BOOST_DURATION,
@@ -123,7 +124,9 @@ async def async_setup_entry(
     async_add_entities([entity])
 
 
-class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, ClimateEntity, RestoreEntity):
+class TadoXProxyClimate(
+    RegulationMixin, PresetMixin, ScheduleMixin, CoordinatorEntity, ClimateEntity, RestoreEntity
+):
     """Proxy climate entity that controls a Tado X TRV via feedforward + PI."""
 
     _attr_has_entity_name = True
@@ -166,6 +169,10 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         self._hvac_mode = HVACMode.HEAT
 
         # Timing
+        self._schedule_unsub = None
+        self._schedule_action_state: str | None = None
+        self._schedule_block_at_ts: float | None = None
+        self._schedule_manual_off = False
         self._regulation_lock = asyncio.Lock()
         self._last_regulation_ts = 0.0
         self._last_command_sent_ts = 0.0
@@ -294,6 +301,12 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         )
         if restored_hvac_mode in (HVACMode.HEAT, HVACMode.OFF):
             self._hvac_mode = HVACMode(restored_hvac_mode)
+        self._schedule_block_at_ts = safe_float(restored_attributes.get("schedule_block_at_ts"))
+        self._schedule_manual_off = restored_attributes.get(
+            "schedule_manual_off",
+            self._hvac_mode == HVACMode.OFF
+            and restored_attributes.get("scheduled_action") != "off",
+        ) is True
         snapshot = StartSnapshot.from_state(
             restored_hvac_mode or (last_state.state if last_state else None),
             restored_attributes,
@@ -342,6 +355,8 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
                 )
             )
 
+        await self._async_start_weekly_schedule()
+
         # Start periodic regulation
         self.async_on_remove(
             async_track_time_interval(
@@ -363,6 +378,7 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
     async def async_will_remove_from_hass(self) -> None:
         """Cancel all timers when the entity is being removed."""
         self._cancel_layer_timers()
+        self._cancel_weekly_schedule_timer()
         await super().async_will_remove_from_hass()
 
     async def _async_config_entry_updated(self, hass, entry) -> None:
@@ -387,6 +403,7 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         effects = self._layers.options_changed(self._layers_config(), time.time())
         self.async_write_ha_state()
         await self._async_handle_layer_effects(effects)
+        await self._async_start_weekly_schedule()
 
     # ------------------------------------------------------------------
     # Follow physical thermostat
@@ -438,13 +455,17 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
     async def _async_source_availability_changed(self) -> None:
         """Refresh source readings and resume regulation after reconnection."""
         await self.coordinator.async_refresh()
+        if self._schedule():
+            await self._async_apply_schedule_state()
         await self._async_regulation_cycle(trigger="source_availability")
 
     # ------------------------------------------------------------------
     # Standard climate controls
     # ------------------------------------------------------------------
 
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+    async def async_set_hvac_mode(
+        self, hvac_mode: HVACMode, *, _from_schedule: bool = False
+    ) -> None:
         """Set new target HVAC mode."""
         if hvac_mode not in self._attr_hvac_modes:
             return
@@ -453,8 +474,13 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         # not interleave with turning the TRV off.  The follow-up cycle runs
         # the lock-free body – asyncio.Lock is not re-entrant.
         async with self._regulation_lock:
+            if _from_schedule and not self._source_available:
+                return
             previous_mode = self._hvac_mode
             previous_result = self._last_result
+            previous_manual_off = self._schedule_manual_off
+            if not _from_schedule:
+                self._schedule_manual_off = hvac_mode == HVACMode.OFF
             self._hvac_mode = hvac_mode
             if hvac_mode == HVACMode.OFF:
                 # No regulation while OFF: error_c and the corrections must not
@@ -475,6 +501,7 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
                     # else changes: the layers and a boost stay as they were.
                     self._hvac_mode = previous_mode
                     self._last_result = previous_result
+                    self._schedule_manual_off = previous_manual_off
                     self._last_reason = "hvac_off_failed"
                     self.async_write_ha_state()
                     return
@@ -522,9 +549,16 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         if not math.isfinite(temp_f):
             _LOGGER.warning("Ignoring non-finite temperature: %s", temp)
             return
+        self._schedule_manual_off = False
         await self._async_handle_layer_effects(
             self._layers.set_temperature(temp_f, time.time())
         )
+        if (
+            self._schedule()
+            and self._hvac_mode == HVACMode.OFF
+            and self._layers.user_choice.preset == PRESET_NONE
+        ):
+            await self.async_set_hvac_mode(HVACMode.HEAT, _from_schedule=True)
 
     # ------------------------------------------------------------------
     # Properties for HA UI
@@ -548,6 +582,7 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
         return _ProxyRestoreData({
             "desired_hvac_mode": self._hvac_mode,
             **self._layers.attributes(),
+            **self._schedule_attributes(),
         })
 
     @property
@@ -620,6 +655,7 @@ class TadoXProxyClimate(RegulationMixin, PresetMixin, CoordinatorEntity, Climate
             # User choice, layer flags and the window's valve state – also
             # read back after a restart.
             **self._layers.attributes(),
+            **self._schedule_attributes(),
             "sensor_degraded": self._control.degraded,
             "active_control_mode": self._control.mode,
             "overlay_refresh_s": self._overlay_refresh_s,
