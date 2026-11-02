@@ -13,6 +13,7 @@ from .climate_controllers import (
     DEFAULT_SENSOR_LOSS_ACTION,
     DEFAULT_WINDOW_ACTION,
     MANUAL_MODE_ACTIONS,
+    MANUAL_MODE_SCHEDULE,
     NEW_ENTRY_SENSOR_LOSS_ACTION,
     SENSOR_LOSS_ACTIONS,
     WINDOW_ACTIONS,
@@ -46,6 +47,7 @@ from .const import (
     CONF_SENSOR_LOSS_ACTION,
     CONF_SOURCE_ENTITY_ID,
     CONF_URGENT_DECREASE_THRESHOLD_C,
+    CONF_WEEKLY_PRESET_SCHEDULE,
     CONF_WINDOW_ACTION,
     CONF_WINDOW_CLOSE_DELAY_S,
     CONF_WINDOW_DELAY_S,
@@ -65,6 +67,7 @@ from .parameters import (
     BehaviourConfig,
     RegulationConfig,
 )
+from .schedule import WEEKDAYS, normalize_weekly_schedule
 
 
 class TadoxProxyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -154,6 +157,8 @@ class TadoxProxyOptionsFlow(config_entries.OptionsFlow):
             # a single flat dict for storage in config_entry.options.
             flat: dict = {}
             for key, value in user_input.items():
+                if key == "weekly_schedule":
+                    continue
                 if isinstance(value, dict):
                     flat.update(value)
                 else:
@@ -173,13 +178,34 @@ class TadoxProxyOptionsFlow(config_entries.OptionsFlow):
                 if key not in cleaned:
                     merged.pop(key, None)
             merged.update(cleaned)
-            errors = {**_validate_sensor_loss(merged), **_validate_needs_heat(merged)}
+            errors: dict[str, str] = {}
+            weekly_input = user_input.get("weekly_schedule")
+            if weekly_input is not None:
+                try:
+                    weekly = normalize_weekly_schedule(weekly_input)
+                except ValueError:
+                    errors["base"] = "invalid_weekly_schedule"
+                else:
+                    if weekly:
+                        merged[CONF_WEEKLY_PRESET_SCHEDULE] = weekly
+                    else:
+                        merged.pop(CONF_WEEKLY_PRESET_SCHEDULE, None)
+            if (
+                not errors
+                and merged.get(CONF_MANUAL_MODE_ACTION) == MANUAL_MODE_SCHEDULE
+                and not merged.get(CONF_WEEKLY_PRESET_SCHEDULE)
+            ):
+                errors["base"] = "schedule_required"
+            errors.update(_validate_sensor_loss(merged))
+            errors.update(_validate_needs_heat(merged))
             if not errors:
                 # A reload, when one is needed, is triggered by the
                 # update_listener in __init__.py AFTER HA has persisted the
                 # new options, avoiding stale data.  Options in
                 # LIVE_OPTION_KEYS (const.py) apply without one.
                 return self.async_create_entry(title="", data=merged)
+            if weekly_input is not None:
+                merged[CONF_WEEKLY_PRESET_SCHEDULE] = weekly_input
             # Show the form again with the values just entered.
             return self.async_show_form(
                 step_id="init", data_schema=self._options_schema(merged), errors=errors
@@ -304,6 +330,40 @@ class TadoxProxyOptionsFlow(config_entries.OptionsFlow):
             }
         )
 
+        schedule_block_selector = selector.ObjectSelector(
+            selector.ObjectSelectorConfig(
+                fields={
+                    "start": {"selector": {"time": {}}, "required": True, "label": "Start time"},
+                    "preset": {
+                        "selector": {
+                            "select": {
+                                "options": [
+                                    {"value": "comfort", "label": "Comfort"},
+                                    {"value": "eco", "label": "Eco"},
+                                    {"value": "frost_protection", "label": "Frost protection"},
+                                    {"value": "off", "label": "Off"},
+                                ],
+                                "translation_key": "schedule_preset",
+                            }
+                        },
+                        "required": True,
+                        "label": "Preset",
+                    },
+                },
+                multiple=True,
+                label_field="start",
+                description_field="preset",
+                translation_key="weekly_schedule_block",
+            )
+        )
+        stored_weekly = opts.get(CONF_WEEKLY_PRESET_SCHEDULE, {})
+        schedule_section_schema = vol.Schema(
+            {
+                vol.Optional(day, default=stored_weekly.get(day, [])): schedule_block_selector
+                for day in WEEKDAYS
+            }
+        )
+
         # --- Main options schema with sections ---
         options_schema = vol.Schema(
             {
@@ -384,6 +444,11 @@ class TadoxProxyOptionsFlow(config_entries.OptionsFlow):
                 # Section: Manual mode (timer and what happens after it)
                 vol.Required("manual_mode"): section(
                     manual_section_schema,
+                    {"collapsed": True},
+                ),
+
+                vol.Required("weekly_schedule"): section(
+                    schedule_section_schema,
                     {"collapsed": True},
                 ),
 

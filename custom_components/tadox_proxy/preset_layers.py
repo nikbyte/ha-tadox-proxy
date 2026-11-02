@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .climate_controllers import (
     DEFAULT_MANUAL_MODE_ACTION,
     MANUAL_MODE_KEEP,
+    MANUAL_MODE_SCHEDULE,
     MANUAL_MODE_TIMER,
     PRESET_AWAY,
     PRESET_BOOST,
@@ -50,6 +51,7 @@ ATTR_USER_PRESET = "user_preset"
 ATTR_MANUAL_TARGET = "manual_target_c"
 ATTR_MANUAL_RETURN_PRESET = "manual_return_preset"
 ATTR_MANUAL_RETURN_AT_TS = "manual_return_at_ts"
+ATTR_SCHEDULE_PRESET_OVERRIDE = "schedule_preset_override"
 ATTR_WINDOW_OPEN_ACTIVE = "window_open_active"
 ATTR_WINDOW_CLOSE_DELAY_ACTIVE = "window_close_delay_active"
 ATTR_PRESENCE_AWAY_ACTIVE = "presence_away_active"
@@ -95,6 +97,7 @@ class LayersConfig:
     has_presence_sensor: bool
     manual_mode_action: str = DEFAULT_MANUAL_MODE_ACTION
     manual_mode_duration_min: int = DEFAULT_MANUAL_MODE_DURATION_MIN
+    next_schedule_at_ts: float | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,7 @@ class StartSnapshot:
     manual_c: float | None = None
     manual_return_preset: str | None = None
     manual_return_at_ts: float | None = None
+    schedule_preset_override: bool = False
     window_held: bool = False
     nobody_home_held: bool = False
     valve_off_by_window: bool = False
@@ -170,6 +174,7 @@ class StartSnapshot:
             manual_c=safe_float(attributes.get(ATTR_MANUAL_TARGET)),
             manual_return_preset=attributes.get(ATTR_MANUAL_RETURN_PRESET),
             manual_return_at_ts=safe_float(attributes.get(ATTR_MANUAL_RETURN_AT_TS)),
+            schedule_preset_override=attributes.get(ATTR_SCHEDULE_PRESET_OVERRIDE) is True,
             window_held=attributes.get(ATTR_WINDOW_OPEN_ACTIVE) is True,
             nobody_home_held=attributes.get(ATTR_PRESENCE_AWAY_ACTIVE) is True,
             valve_off_by_window=attributes.get(ATTR_WINDOW_TRV_OFF) is True,
@@ -220,6 +225,8 @@ class PresetLayers:
         # running).
         self._manual_return_preset: str | None = None
         self._manual_return_at_ts: float | None = None
+        self._scheduled_preset: str | None = None
+        self._schedule_preset_override = False
         # Timers the caller runs for this module, and what to tell the
         # caller about them after the current event.
         self._armed: set[str] = set()
@@ -261,6 +268,7 @@ class PresetLayers:
         if not self._layer_forces(preset):
             self._cancel_manual_return()
             self._user = UserChoice(preset)
+            self._schedule_preset_override = self._config.next_schedule_at_ts is not None
         return self._effects("preset_change")
 
     def set_temperature(self, temp_c: float, now: float) -> Effects:
@@ -400,6 +408,7 @@ class PresetLayers:
         self._window_state = snapshot.window_state
         self._presence_state = snapshot.presence_state
         self._valve_off_by_window = snapshot.valve_off_by_window
+        self._schedule_preset_override = snapshot.schedule_preset_override
         if snapshot.user_preset is None:
             self._user, window_held, nobody_home_held = self._upgrade_from_v14(snapshot)
         else:
@@ -420,7 +429,7 @@ class PresetLayers:
             elif snapshot.presence_state == _OFF:
                 self._start_away_delay()
         if (
-            self._config.manual_mode_action == MANUAL_MODE_TIMER
+            self._config.manual_mode_action in (MANUAL_MODE_TIMER, MANUAL_MODE_SCHEDULE)
             and self._user.preset == PRESET_NONE
             and snapshot.manual_return_preset in _CHOOSABLE
             and snapshot.manual_return_at_ts is not None
@@ -430,9 +439,34 @@ class PresetLayers:
             if self._manual_return_at_ts <= now:
                 self._user = UserChoice(self._manual_return_preset)
                 self._cancel_manual_return()
-            else:
+            elif self._config.manual_mode_action == MANUAL_MODE_TIMER:
                 self._arm(TIMER_MANUAL_RETURN, self._manual_return_at_ts - now)
         return self._effects(None)
+
+    def schedule_changed(
+        self, preset: str | None, next_at_ts: float | None, now: float, *, boundary: bool
+    ) -> Effects:
+        """Update the schedule base; a block may end Manual when configured."""
+        self._begin(now)
+        self._scheduled_preset = preset if preset in _CHOOSABLE else None
+        self._config = replace(self._config, next_schedule_at_ts=next_at_ts)
+        if boundary or next_at_ts is None:
+            self._schedule_preset_override = False
+        if (
+            boundary
+            and self._user.preset == PRESET_NONE
+            and self._config.manual_mode_action == MANUAL_MODE_SCHEDULE
+        ):
+            if self._scheduled_preset is not None:
+                self._user = UserChoice(self._scheduled_preset)
+            elif self._manual_return_preset in _CHOOSABLE:
+                self._user = UserChoice(self._manual_return_preset)
+            else:
+                self._user = UserChoice(PRESET_COMFORT)
+            self._cancel_manual_return()
+        elif self._user.preset == PRESET_NONE and self._config.manual_mode_action == MANUAL_MODE_SCHEDULE:
+            self._manual_return_at_ts = next_at_ts
+        return self._effects("schedule_change")
 
     def timer_elapsed(self, timer_id: str, now: float) -> Effects:
         """The timer *timer_id* the caller ran for this module has elapsed."""
@@ -456,12 +490,21 @@ class PresetLayers:
             return PRESET_AWAY
         if self._boost_left_s is not None:
             return PRESET_BOOST
+        if self._user.preset == PRESET_NONE:
+            return PRESET_NONE
+        if self._scheduled_preset is not None and not self._schedule_preset_override:
+            return self._scheduled_preset
         return self._user.preset
 
     @property
     def user_choice(self) -> UserChoice:
         """The preset a person last picked; comes back once no layer holds."""
         return self._user
+
+    @property
+    def schedule_preset_override(self) -> bool:
+        """A named preset was picked until the next schedule block."""
+        return self._schedule_preset_override
 
     @property
     def window_holds(self) -> bool:
@@ -497,6 +540,8 @@ class PresetLayers:
         if self._manual_return_preset is not None and self._manual_return_at_ts is not None:
             attrs[ATTR_MANUAL_RETURN_PRESET] = self._manual_return_preset
             attrs[ATTR_MANUAL_RETURN_AT_TS] = self._manual_return_at_ts
+        if self._schedule_preset_override:
+            attrs[ATTR_SCHEDULE_PRESET_OVERRIDE] = True
         if self._valve_off_by_window:
             attrs[ATTR_WINDOW_TRV_OFF] = True
         return attrs
@@ -560,12 +605,28 @@ class PresetLayers:
         self._begin(now)
         self._change_by_person()
         self._end_boost()
-        return_preset = self._manual_return_preset or self._user.preset
-        if self._config.manual_mode_action == MANUAL_MODE_TIMER and return_preset in _CHOOSABLE:
-            delay_s = self._config.manual_mode_duration_min * 60
-            self._manual_return_preset = return_preset
-            self._manual_return_at_ts = now + delay_s
-            self._arm(TIMER_MANUAL_RETURN, delay_s)
+        self._schedule_preset_override = False
+        if self._config.manual_mode_action in (MANUAL_MODE_TIMER, MANUAL_MODE_SCHEDULE):
+            previous = self._manual_return_preset or self._user.preset
+            if previous not in _CHOOSABLE and self._config.next_schedule_at_ts is not None:
+                previous = self._scheduled_preset or PRESET_COMFORT
+            if previous in _CHOOSABLE:
+                delay_s = (
+                    self._config.manual_mode_duration_min * 60
+                    if self._config.manual_mode_action == MANUAL_MODE_TIMER
+                    else (self._config.next_schedule_at_ts - now)
+                    if self._config.next_schedule_at_ts is not None
+                    else 0
+                )
+                if delay_s > 0:
+                    self._manual_return_preset = previous
+                    self._manual_return_at_ts = now + delay_s
+                    if self._config.manual_mode_action == MANUAL_MODE_TIMER:
+                        self._arm(TIMER_MANUAL_RETURN, delay_s)
+                else:
+                    self._cancel_manual_return()
+            else:
+                self._cancel_manual_return()
         else:
             self._cancel_manual_return()
         limited = max(self._config.min_target_c, min(self._config.max_target_c, temp_c))
@@ -663,7 +724,9 @@ class PresetLayers:
         if timer_id == TIMER_MANUAL_RETURN:
             return_preset = self._manual_return_preset
             self._cancel_manual_return()
-            if return_preset in _CHOOSABLE:
+            if self._scheduled_preset in _CHOOSABLE:
+                self._user = UserChoice(self._scheduled_preset)
+            elif return_preset in _CHOOSABLE:
                 self._user = UserChoice(return_preset)
             return "manual_return"
         self._end_boost()

@@ -42,6 +42,7 @@ CONF_PRESENCE_HOME_DELAY_S = "presence_home_delay_s"
 # Manual mode (stored in options).
 CONF_MANUAL_MODE_ACTION = "manual_mode_action"
 CONF_MANUAL_MODE_DURATION_MIN = "manual_mode_duration_min"
+CONF_WEEKLY_PRESET_SCHEDULE = "weekly_preset_schedule"
 
 # Custom preset name (not a HA built-in)
 PRESET_FROST_PROTECTION = "frost_protection"
