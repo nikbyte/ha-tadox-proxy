@@ -45,6 +45,8 @@ or an away phase.
 Moving the temperature slider without picking a preset switches to **Manual**. Your
 stored Comfort temperature is left alone, so you can always get back to it.
 
+### Manual duration
+
 In the **Manual mode** options, you can keep Manual until you pick another preset
 (the default), or end Manual after a timer. The timer takes 1 to 1440 minutes (default
 15), restarts whenever you change the manual temperature, and survives a Home Assistant
@@ -75,6 +77,26 @@ command:
 
 Manual that was already set when you switch the option to the timer has no preset to
 go back to. It stays without an end until a preset has been picked once.
+
+### Weekly schedule
+
+The **Weekly schedule** options let you add start times and choose Comfort, Eco,
+Frost Protection or Off for each day. A block continues until the next block,
+including across midnight and the end of the week. The schedule is stored in the
+integration options and survives restarts; no Schedule helper is needed.
+
+With a schedule, Manual can also last **until the next schedule block**. A timed
+Manual change lasts its full duration even if blocks change meanwhile, then resumes
+the block active at expiry. Picking a named preset cancels Manual and holds that
+choice until the next block. A manual Off also lasts until the next block, which
+can turn heating back on. Restarting or receiving a sensor report does not end
+either override; a block missed while HA was stopped is applied on startup.
+Changing the target temperature while heating is Off saves the target without
+turning heating on. Select Heat explicitly to enable it before the next block.
+
+Window protection, Presence Away and Boost take priority over scheduled blocks,
+including Off. Once they end, the current block resumes. A manual Off keeps the
+heating off until the next block.
 
 ### Your choice, and what can take over
 
@@ -590,3 +612,9 @@ either have no valve to control or respond far too slowly for this approach.
 
 Different radiator types benefit from slightly different settings. The
 [tuning guide](../TUNING.md#tuning-by-radiator-type) has a starting point for each.
+
+A direct **Heat** command during an Off block overrides that block until the next
+actual block starts. Sensor reports, options changes and restarting Home Assistant
+do not cancel it. This is separate from changing the temperature: a temperature
+command alone never enables heating that was switched off. Removing a weekly plan
+keeps the current HVAC mode; removing an Off block's plan does not turn heating on.

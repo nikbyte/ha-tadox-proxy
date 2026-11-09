@@ -62,6 +62,7 @@ SETUP_INPUT: dict[str, Any] = {
 
 # The sections of the options dialog; the form requires every one.
 OPTIONS_SECTIONS = (
+    "weekly_schedule",
     "window_sensor",
     "presence_sensor",
     "needs_heat",
@@ -237,14 +238,19 @@ async def async_submit_options(
     """
     unknown = sections.keys() - set(OPTIONS_SECTIONS)
     assert not unknown, f"no options section {sorted(unknown)}"
-    kept_sensors: dict[str, dict[str, Any]] = {
+    kept_sections: dict[str, dict[str, Any]] = {
+        "weekly_schedule": entry.options.get("weekly_preset_schedule", {}),
         "window_sensor": {"window_sensor_id": WINDOW_SENSOR},
         "presence_sensor": {"presence_sensor_id": PRESENCE_SENSOR},
     }
     user_input: dict[str, Any] = {
         **(top_level or {}),
         **{
-            name: {**kept_sensors.get(name, {}), **sections.get(name, {})}
+            name: (
+                sections[name]
+                if name == "weekly_schedule" and name in sections
+                else {**kept_sections.get(name, {}), **sections.get(name, {})}
+            )
             for name in OPTIONS_SECTIONS
         },
     }
